@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enrich a CSV of people with LinkedIn profile URLs using Exa Answer API."""
+"""Enrich a CSV of people with LinkedIn, role, and email using Exa Answer API (batched)."""
 
 import csv
 import json
@@ -15,42 +15,73 @@ if not EXA_API_KEY:
 
 INPUT_CSV = sys.argv[1] if len(sys.argv) > 1 else "people.csv"
 OUTPUT_CSV = sys.argv[2] if len(sys.argv) > 2 else INPUT_CSV.replace(".csv", "_enriched.csv")
+BATCH_SIZE = 5  # People per API call
 
 OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "linkedin_url": {
-            "type": "string",
-            "description": "The LinkedIn profile URL for this person. Empty string if not found.",
-        },
-        "linkedin_headline": {
-            "type": "string",
-            "description": "The person's LinkedIn headline or current role description.",
-        },
-        "confidence": {
-            "type": "string",
-            "enum": ["high", "medium", "low"],
-            "description": "How confident you are this is the right person.",
+        "people": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The person's full name as provided.",
+                    },
+                    "role": {
+                        "type": "string",
+                        "description": "Their current role/title and company.",
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Their email address. Empty string if not found.",
+                    },
+                    "linkedin": {
+                        "type": "string",
+                        "description": "Their LinkedIn profile URL (linkedin.com/in/...).",
+                    },
+                    "additional_links": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Any other relevant profile links (Twitter, personal site, etc.).",
+                    },
+                },
+                "required": ["name", "role", "email", "linkedin", "additional_links"],
+            },
         },
     },
-    "required": ["linkedin_url", "linkedin_headline", "confidence"],
+    "required": ["people"],
 }
 
 
-def find_linkedin(name: str, company: str = "", title: str = "") -> dict:
-    """Use Exa Answer API to find a person's LinkedIn profile."""
+def build_people_list(rows: list[dict]) -> str:
+    """Build a text list of people from CSV rows."""
+    lines = []
+    for row in rows:
+        name = row.get("name", "").strip()
+        parts = [name]
+        title = row.get("title", "").strip()
+        company = row.get("company", "").strip()
+        instagram = row.get("instagram", "").strip()
+        if title:
+            parts.append(title)
+        if company:
+            parts.append(f"at {company}")
+        if instagram:
+            parts.append(f"(Instagram: @{instagram.lstrip('@')})")
+        lines.append(" - ".join(parts))
+    return "\n".join(lines)
 
-    # Build a natural-language prompt
-    person_desc = name
-    if title:
-        person_desc += f", {title}"
-    if company:
-        person_desc += f" at {company}"
+
+def enrich_batch(rows: list[dict]) -> list[dict]:
+    """Send a batch of people to Exa Answer API and get enriched data back."""
+    people_list = build_people_list(rows)
 
     query = (
-        f"Find the LinkedIn profile URL for {person_desc}. "
-        f"Search LinkedIn specifically. "
-        f"Return their exact linkedin.com/in/ profile URL and their headline."
+        f"Here are some people:\n\n{people_list}\n\n"
+        f"What are the LinkedIns of these people and their role and their email? "
+        f"Give in array structure."
     )
 
     body = json.dumps({
@@ -71,41 +102,52 @@ def find_linkedin(name: str, company: str = "", title: str = "") -> dict:
     )
 
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode()
         print(f"  API error ({e.code}): {err_body}")
-        return {"linkedin_url": "", "linkedin_headline": "", "confidence": ""}
+        return []
     except Exception as e:
         print(f"  Request failed: {e}")
-        return {"linkedin_url": "", "linkedin_headline": "", "confidence": ""}
+        return []
 
-    answer = data.get("answer", {})
+    answer = data.get("answer", [])
 
-    # answer could be a string (unstructured) or dict (structured via outputSchema)
     if isinstance(answer, str):
-        # Fallback: try to parse as JSON in case it's a JSON string
         try:
             answer = json.loads(answer)
         except (json.JSONDecodeError, TypeError):
-            # Try to extract a linkedin URL from the text
-            linkedin_url = ""
-            for word in answer.split():
-                if "linkedin.com/in/" in word:
-                    linkedin_url = word.strip("(),\"'")
-                    break
-            return {
-                "linkedin_url": linkedin_url,
-                "linkedin_headline": answer[:200] if answer else "",
-                "confidence": "",
-            }
+            print(f"  Could not parse response: {answer[:200]}")
+            return []
 
-    return {
-        "linkedin_url": answer.get("linkedin_url", ""),
-        "linkedin_headline": answer.get("linkedin_headline", ""),
-        "confidence": answer.get("confidence", ""),
-    }
+    if isinstance(answer, dict):
+        answer = answer.get("people", [answer])
+
+    return answer if isinstance(answer, list) else []
+
+
+def match_results(rows: list[dict], results: list[dict]) -> None:
+    """Match API results back to CSV rows by name."""
+    # Index results by lowercase name for fuzzy matching
+    result_map = {}
+    for r in results:
+        rname = r.get("name", "").strip().lower()
+        if rname:
+            result_map[rname] = r
+
+    for row in rows:
+        name = row.get("name", "").strip().lower()
+        match = result_map.get(name)
+        if match:
+            row["linkedin"] = match.get("linkedin", "")
+            row["role"] = match.get("role", row.get("role", ""))
+            row["email"] = match.get("email", "")
+            row["additional_links"] = "; ".join(match.get("additional_links", []))
+        else:
+            row.setdefault("linkedin", "")
+            row.setdefault("email", "")
+            row.setdefault("additional_links", "")
 
 
 def main():
@@ -115,40 +157,42 @@ def main():
         rows = list(reader)
 
     # Add enrichment columns
-    for col in ("linkedin_url", "linkedin_headline", "confidence"):
+    for col in ("linkedin", "role", "email", "additional_links"):
         if col not in fieldnames:
             fieldnames.append(col)
 
-    print(f"Processing {len(rows)} people from {INPUT_CSV}...\n")
+    print(f"Processing {len(rows)} people from {INPUT_CSV} (batch size: {BATCH_SIZE})...\n")
 
-    for i, row in enumerate(rows):
-        name = row.get("name", "").strip()
-        if not name:
-            continue
+    # Process in batches
+    for start in range(0, len(rows), BATCH_SIZE):
+        batch = rows[start : start + BATCH_SIZE]
+        batch_num = (start // BATCH_SIZE) + 1
+        total_batches = (len(rows) + BATCH_SIZE - 1) // BATCH_SIZE
 
-        company = row.get("company", "").strip()
-        title = row.get("title", "").strip()
+        names = [r.get("name", "").strip() for r in batch]
+        print(f"[Batch {batch_num}/{total_batches}] {', '.join(names)}")
 
-        label = name
-        if title:
-            label += f" ({title})"
-        if company:
-            label += f" at {company}"
-        print(f"[{i + 1}/{len(rows)}] {label}")
+        results = enrich_batch(batch)
 
-        result = find_linkedin(name, company, title)
-        row["linkedin_url"] = result["linkedin_url"]
-        row["linkedin_headline"] = result["linkedin_headline"]
-        row["confidence"] = result["confidence"]
-
-        if result["linkedin_url"]:
-            print(f"  -> {result['linkedin_url']}")
-            print(f"     {result['linkedin_headline']} [{result['confidence']}]")
+        if results:
+            match_results(batch, results)
+            for r in results:
+                name = r.get("name", "")
+                linkedin = r.get("linkedin", "")
+                role = r.get("role", "")
+                email = r.get("email", "")
+                links = r.get("additional_links", [])
+                print(f"  {name}")
+                print(f"    role:     {role}")
+                print(f"    email:    {email or '-'}")
+                print(f"    linkedin: {linkedin or '-'}")
+                if links:
+                    print(f"    links:    {', '.join(links)}")
         else:
-            print("  -> No LinkedIn found")
+            print("  No results returned")
 
-        # Rate limit
-        if i < len(rows) - 1:
+        # Rate limit between batches
+        if start + BATCH_SIZE < len(rows):
             time.sleep(1)
 
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:

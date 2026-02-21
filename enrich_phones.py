@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Enrich a CSV of people (name + Instagram) with phone numbers using Exa Answer API."""
+"""Enrich a CSV of people (name + Instagram) with phone numbers using Exa Answer API (batched)."""
 
 import csv
 import json
@@ -15,53 +15,69 @@ if not EXA_API_KEY:
 
 INPUT_CSV = sys.argv[1] if len(sys.argv) > 1 else "people.csv"
 OUTPUT_CSV = sys.argv[2] if len(sys.argv) > 2 else INPUT_CSV.replace(".csv", "_phones.csv")
+BATCH_SIZE = 5
 
 OUTPUT_SCHEMA = {
     "type": "object",
     "properties": {
-        "phone_number": {
-            "type": "string",
-            "description": "The person's phone number including country code. Empty string if not found.",
-        },
-        "phone_type": {
-            "type": "string",
-            "enum": ["mobile", "work", "unknown"],
-            "description": "Type of phone number if determinable.",
-        },
-        "email": {
-            "type": "string",
-            "description": "Email address if found. Empty string if not found.",
-        },
-        "source": {
-            "type": "string",
-            "description": "Where the contact info was found (e.g. website name, directory).",
-        },
-        "confidence": {
-            "type": "string",
-            "enum": ["high", "medium", "low"],
-            "description": "How confident you are this contact info belongs to the right person.",
+        "people": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "The person's full name as provided.",
+                    },
+                    "phone_number": {
+                        "type": "string",
+                        "description": "Phone number with country code. Empty string if not found.",
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Email address. Empty string if not found.",
+                    },
+                    "source": {
+                        "type": "string",
+                        "description": "Where the contact info was found.",
+                    },
+                },
+                "required": ["name", "phone_number", "email", "source"],
+            },
         },
     },
-    "required": ["phone_number", "phone_type", "email", "source", "confidence"],
+    "required": ["people"],
 }
 
 
-def find_phone(name: str, instagram: str = "", company: str = "", title: str = "") -> dict:
-    """Use Exa Answer API to find a person's phone number."""
+def build_people_list(rows: list[dict]) -> str:
+    """Build a text list of people from CSV rows."""
+    lines = []
+    for row in rows:
+        name = row.get("name", "").strip()
+        parts = [name]
+        title = row.get("title", "").strip()
+        company = row.get("company", "").strip()
+        instagram = row.get("instagram", "").strip()
+        if title:
+            parts.append(title)
+        if company:
+            parts.append(f"at {company}")
+        if instagram:
+            parts.append(f"(Instagram: @{instagram.lstrip('@')})")
+        lines.append(" - ".join(parts))
+    return "\n".join(lines)
 
-    person_desc = name
-    if title:
-        person_desc += f", {title}"
-    if company:
-        person_desc += f" at {company}"
 
-    query = f"Find the phone number and contact information for {person_desc}."
-    if instagram:
-        ig = instagram.lstrip("@")
-        query += f" Their Instagram handle is @{ig} (instagram.com/{ig})."
-    query += (
-        " Search public directories, personal websites, about pages, and contact pages."
-        " Return their phone number with country code, email if available, and where you found it."
+def enrich_batch(rows: list[dict]) -> list[dict]:
+    """Send a batch of people to Exa Answer API for phone/email lookup."""
+    people_list = build_people_list(rows)
+
+    query = (
+        f"Here are some people:\n\n{people_list}\n\n"
+        f"What are the phone numbers and emails of these people? "
+        f"Search public directories, personal websites, about pages, and contact pages. "
+        f"Give in array structure."
     )
 
     body = json.dumps({
@@ -81,34 +97,51 @@ def find_phone(name: str, instagram: str = "", company: str = "", title: str = "
         },
     )
 
-    empty = {"phone_number": "", "phone_type": "", "email": "", "source": "", "confidence": ""}
-
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=60) as resp:
             data = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         err_body = e.read().decode()
         print(f"  API error ({e.code}): {err_body}")
-        return empty
+        return []
     except Exception as e:
         print(f"  Request failed: {e}")
-        return empty
+        return []
 
-    answer = data.get("answer", {})
+    answer = data.get("answer", [])
 
     if isinstance(answer, str):
         try:
             answer = json.loads(answer)
         except (json.JSONDecodeError, TypeError):
-            return {**empty, "source": answer[:200] if answer else ""}
+            print(f"  Could not parse response: {answer[:200]}")
+            return []
 
-    return {
-        "phone_number": answer.get("phone_number", ""),
-        "phone_type": answer.get("phone_type", ""),
-        "email": answer.get("email", ""),
-        "source": answer.get("source", ""),
-        "confidence": answer.get("confidence", ""),
-    }
+    if isinstance(answer, dict):
+        answer = answer.get("people", [answer])
+
+    return answer if isinstance(answer, list) else []
+
+
+def match_results(rows: list[dict], results: list[dict]) -> None:
+    """Match API results back to CSV rows by name."""
+    result_map = {}
+    for r in results:
+        rname = r.get("name", "").strip().lower()
+        if rname:
+            result_map[rname] = r
+
+    for row in rows:
+        name = row.get("name", "").strip().lower()
+        match = result_map.get(name)
+        if match:
+            row["phone_number"] = match.get("phone_number", "")
+            row["email"] = match.get("email", "")
+            row["source"] = match.get("source", "")
+        else:
+            row.setdefault("phone_number", "")
+            row.setdefault("email", "")
+            row.setdefault("source", "")
 
 
 def main():
@@ -117,43 +150,37 @@ def main():
         fieldnames = list(reader.fieldnames)
         rows = list(reader)
 
-    for col in ("phone_number", "phone_type", "email", "source", "confidence"):
+    for col in ("phone_number", "email", "source"):
         if col not in fieldnames:
             fieldnames.append(col)
 
-    print(f"Processing {len(rows)} people from {INPUT_CSV}...\n")
+    print(f"Processing {len(rows)} people from {INPUT_CSV} (batch size: {BATCH_SIZE})...\n")
 
-    for i, row in enumerate(rows):
-        name = row.get("name", "").strip()
-        if not name:
-            continue
+    for start in range(0, len(rows), BATCH_SIZE):
+        batch = rows[start : start + BATCH_SIZE]
+        batch_num = (start // BATCH_SIZE) + 1
+        total_batches = (len(rows) + BATCH_SIZE - 1) // BATCH_SIZE
 
-        instagram = row.get("instagram", "").strip()
-        company = row.get("company", "").strip()
-        title = row.get("title", "").strip()
+        names = [r.get("name", "").strip() for r in batch]
+        print(f"[Batch {batch_num}/{total_batches}] {', '.join(names)}")
 
-        label = name
-        if instagram:
-            label += f" (@{instagram.lstrip('@')})"
-        if company:
-            label += f" at {company}"
-        print(f"[{i + 1}/{len(rows)}] {label}")
+        results = enrich_batch(batch)
 
-        result = find_phone(name, instagram, company, title)
-        for key in ("phone_number", "phone_type", "email", "source", "confidence"):
-            row[key] = result[key]
-
-        if result["phone_number"]:
-            print(f"  -> {result['phone_number']} ({result['phone_type']}) [{result['confidence']}]")
-            if result["email"]:
-                print(f"     {result['email']}")
-            print(f"     via {result['source']}")
+        if results:
+            match_results(batch, results)
+            for r in results:
+                name = r.get("name", "")
+                phone = r.get("phone_number", "")
+                email = r.get("email", "")
+                source = r.get("source", "")
+                print(f"  {name}")
+                print(f"    phone:  {phone or '-'}")
+                print(f"    email:  {email or '-'}")
+                print(f"    source: {source or '-'}")
         else:
-            print("  -> No phone found")
-            if result["email"]:
-                print(f"     Email: {result['email']}")
+            print("  No results returned")
 
-        if i < len(rows) - 1:
+        if start + BATCH_SIZE < len(rows):
             time.sleep(1)
 
     with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as f:
