@@ -1,0 +1,16 @@
+# Secrets and credentials
+.env
+.env.*
+
+# Memory files with credentials
+default/
+
+# Playwright
+.playwright-mcp/
+
+# CSV data (may contain PII)
+*.csv
+
+# Python
+__pycache__/
+*.pyc
